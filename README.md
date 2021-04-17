@@ -5,3 +5,5 @@ These files represent GPIO functionality:
 - qt-app: Qt project containing neccessary GUI functionality (qt-app run file added from build folder)
 - led-designer-plugin: LED plugin needed to instantiate LED widget in Qt Designer
 - uRamDisk: initramfs file
+
+Program within initramfs file, i.e. within rootfs is located in /home directory (/home/sysfs_app).
