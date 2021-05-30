@@ -25,7 +25,7 @@ class QTimer;
 class QDESIGNER_WIDGET_EXPORT LED : public QWidget
 {
     /* Inherent properties of QObject */
-    Q_OBJECT
+	Q_OBJECT
 
     /**
      * @brief Diameter of LED widget
@@ -71,29 +71,29 @@ public:
      * shared memory, starts timer and makes preparations for
      * refreshing read GPIO value
      */
-    explicit LED(QWidget* parent=0);
+	explicit LED(QWidget* parent=0);
 
     /**
      * @brief Destructor
      *
      * Destructor unlinks shared memory
      */
-    ~LED();
+	~LED();
 
     /** Method returning the diameter value */
     double diameter() const;
     /** Method which sets the LED widget diameter */
-    void setDiameter(double diameter);
+	void setDiameter(double diameter);
 
     /** Method returning the color value */
     QColor color() const;
     /** Method which sets the LED widget color */
-    void setColor(const QColor& color);
+	void setColor(const QColor& color);
 
     /** Method returning the aligment value */
     Qt::Alignment alignment() const;
     /** Method which sets the LED widget aligment */
-    void setAlignment(Qt::Alignment alignment);
+	void setAlignment(Qt::Alignment alignment);
 
     /** Method returning the LED state */
     bool state() const;
@@ -117,19 +117,19 @@ public slots:
 
 public:
     /** Method which returns the preferred height for the widget given the width */
-    int heightForWidth(int width) const;
+	int heightForWidth(int width) const;
 
     /** Method which gives a clue about how to size the widget */
-    QSize sizeHint() const;
+	QSize sizeHint() const;
 
     /** Method which returns the recommended minimum size for your widget*/
-    QSize minimumSizeHint() const;
+	QSize minimumSizeHint() const;
 
 protected:
     /** Method which paints LED when it's shown or updated.
      * It's called upon update()
      */
-    void paintEvent(QPaintEvent* event);
+	void paintEvent(QPaintEvent* event);
 
     /** Mapping shared memory data to private data */
     void mapToSharedMemory();

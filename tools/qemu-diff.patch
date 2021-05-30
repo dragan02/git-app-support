@@ -1,0 +1,733 @@
+diff -rupN qemu/hw/arm/vexpress.c qemu-3.1.0/hw/arm/vexpress.c
+--- qemu/hw/arm/vexpress.c	2018-12-11 18:44:34.000000000 +0100
++++ qemu-3.1.0/hw/arm/vexpress.c	2021-05-20 16:10:45.931267779 +0200
+@@ -160,6 +160,18 @@ static hwaddr motherboard_aseries_map[]
+     [VE_CLCD] = 0x1c1f0000,
+ };
+ 
++/* PL061 GPIO address and IRQ number */
++#define VE_PL061_GPIO (0x10003000)
++#define VE_PL061_GPIO_IRQ (26)
++
++/* Custom I2C sensor address */
++#define VE_CUSTOM_I2C_SENS (0x10008000)
++#define VE_CUSTOM_I2C_SENS_ADDR (27)
++
++/* Custom memory-mapped sensor address and IRQ number */
++#define VE_CUSTOM_MMS (0x1000D000)
++#define VE_CUSTOM_MMS_IRQ (28)
++
+ /* Structure defining the peculiarities of a specific daughterboard */
+ 
+ typedef struct VEDBoardInfo VEDBoardInfo;
+@@ -640,6 +652,17 @@ static void vexpress_common_init(Machine
+ 
+     sysbus_create_simple("sp804", map[VE_TIMER01], pic[2]);
+     sysbus_create_simple("sp804", map[VE_TIMER23], pic[3]);
++    
++    /* PL061 GPIO instantiation */
++    sysbus_create_simple("pl061", VE_PL061_GPIO, pic[VE_PL061_GPIO_IRQ]);
++
++    /* Custom I2C sensor instantiation */
++    dev = sysbus_create_simple("versatile_i2c", VE_CUSTOM_I2C_SENS, NULL);
++    i2c = (I2CBus *)qdev_get_child_bus(dev, "i2c");
++    i2c_create_slave(i2c, "custom.i2csens", VE_CUSTOM_I2C_SENS_ADDR);
++    
++    /* Custom memory mapped sensor instantiation */
++    sysbus_create_simple("custom.mmsens", VE_CUSTOM_MMS, pic[VE_CUSTOM_MMS_IRQ]);
+ 
+     dev = sysbus_create_simple("versatile_i2c", map[VE_SERIALDVI], NULL);
+     i2c = (I2CBus *)qdev_get_child_bus(dev, "i2c");
+diff -rupN qemu/hw/gpio/pl061.c qemu-3.1.0/hw/gpio/pl061.c
+--- qemu/hw/gpio/pl061.c	2018-12-11 18:44:34.000000000 +0100
++++ qemu-3.1.0/hw/gpio/pl061.c	2021-05-29 14:11:40.027003608 +0200
+@@ -11,8 +11,15 @@
+ #include "qemu/osdep.h"
+ #include "hw/sysbus.h"
+ #include "qemu/log.h"
++#include "qemu/main-loop.h" /* iothread mutex */
+ 
+-//#define DEBUG_PL061 1
++/* Aditional includes, needed for shared memory */
++#include <semaphore.h>  /* Semaphore */
++#include <fcntl.h>      /* Defines O_* constants */
++#include <sys/stat.h>   /* Defines mode constants */
++#include <sys/mman.h>   /* Defines mmap flags */
++
++//#define DEBUG_PL061 1 
+ 
+ #ifdef DEBUG_PL061
+ #define DPRINTF(fmt, ...) \
+@@ -60,8 +67,11 @@ typedef struct PL061State {
+     uint32_t amsel;
+     qemu_irq irq;
+     qemu_irq out[8];
++    QemuThread thread; /* Semaphore thread */
+     const unsigned char *id;
+     uint32_t rsvd_start; /* reserved area: [rsvd_start, 0xfcc] */
++    uint32_t *shmem;    /* Shared register meant to store IN/OUT data */
++    sem_t *sem;         /* Named semaphore */
+ } PL061State;
+ 
+ static const VMStateDescription vmstate_pl061 = {
+@@ -100,7 +110,7 @@ static void pl061_update(PL061State *s)
+     uint8_t mask;
+     uint8_t out;
+     int i;
+-
++  
+     DPRINTF("dir = %d, data = %d\n", s->dir, s->data);
+ 
+     /* Outputs float high.  */
+@@ -153,6 +163,8 @@ static uint64_t pl061_read(void *opaque,
+                            unsigned size)
+ {
+     PL061State *s = (PL061State *)opaque;
++    
++    DPRINTF("pl061_read\n");
+ 
+     if (offset < 0x400) {
+         return s->data & (offset >> 2);
+@@ -216,10 +228,16 @@ static void pl061_write(void *opaque, hw
+ {
+     PL061State *s = (PL061State *)opaque;
+     uint8_t mask;
++    
++    DPRINTF("pl061_write\n");
+ 
+     if (offset < 0x400) {
+         mask = (offset >> 2) & s->dir;
+         s->data = (s->data & ~mask) | (value & mask);
++        
++        /* Update shared memory data */
++        *s->shmem = s->data;
++        
+         pl061_update(s);
+         return;
+     }
+@@ -286,6 +304,7 @@ static void pl061_write(void *opaque, hw
+     default:
+         goto err_out;
+     }
++    
+     pl061_update(s);
+     return;
+ err_out:
+@@ -331,6 +350,7 @@ static void pl061_set_irq(void * opaque,
+         s->data &= ~mask;
+         if (level)
+             s->data |= mask;
++        DPRINTF("pl061_set_irq\n");
+         pl061_update(s);
+     }
+ }
+@@ -349,6 +369,79 @@ static void pl061_luminary_init(Object *
+     s->rsvd_start = 0x52c;
+ }
+ 
++/* Function which makes shared memory segment and returns pointer to it */
++static void * get_shmem_pointer(void)
++{
++    int fd, seg_size;
++    void *addr;
++    
++    DPRINTF("GPIO shared memory initialization\n");
++    
++    /* Auxiliary variable for storing size of shared memory */
++    seg_size = sizeof(uint32_t);
++    
++    /* Create new shared memory object */
++    fd = shm_open("gpio", O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR);
++    if (fd == -1){
++        DPRINTF("Function shm_open failed\n");
++    }
++    
++    /* Set sh. mem. segment size */
++    if (ftruncate(fd, seg_size) == -1){
++        DPRINTF("Truncating shared memory failed\n");
++    }
++    
++    /* Map shared memory object to process virtual address space */
++    addr = (uint32_t*)mmap(NULL, seg_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (addr == MAP_FAILED) {
++        DPRINTF("Memory mapping failed\n");
++    }
++
++    /* Close appropriate sh. mem. object */
++    if (close(fd) == -1){
++        DPRINTF("Closing shmem file descriptor failed\n");
++    }
++    
++    return addr;
++
++}
++
++/* 
++* Semaphore thread
++*
++* Additional thread which waits for semaphore notification after which
++* PL061 data is being updated from shared memory
++*/
++static void * semaphore_thread(void * arg)
++{
++    PL061State *s = (PL061State*) arg;
++  
++    /* Get named semaphore pointer */
++    s->sem = sem_open("/gpio", O_CREAT | O_RDWR, S_IRUSR | S_IWUSR, 0);
++    if (s->sem == SEM_FAILED){
++        DPRINTF("Opening named semaphore failed\n");
++        exit(1);
++    }
++    else{
++        DPRINTF("Opening named semaphore succeded\n");
++    }
++  
++    while(1)
++    {
++        sem_wait(s->sem);
++        
++        DPRINTF("GPIO data updated\n");
++      
++        /* Update data from shared memory */
++        s->data = *s->shmem;
++    
++        /* Update IRQ status */
++        qemu_mutex_lock_iothread();
++        pl061_update(s);
++        qemu_mutex_unlock_iothread();
++    }
++}
++
+ static void pl061_init(Object *obj)
+ {
+     PL061State *s = PL061(obj);
+@@ -363,6 +456,14 @@ static void pl061_init(Object *obj)
+     sysbus_init_irq(sbd, &s->irq);
+     qdev_init_gpio_in(dev, pl061_set_irq, 8);
+     qdev_init_gpio_out(dev, s->out, 8);
++    
++    /* Get shared memory pointer */
++    s->shmem = get_shmem_pointer();
++
++    /* Make new thread which checks semaphore value */
++    qemu_thread_create(&s->thread, "gpio_semaphore", semaphore_thread, s, QEMU_THREAD_JOINABLE);
++    
++    DPRINTF("GPIO initialized\n");
+ }
+ 
+ static void pl061_class_init(ObjectClass *klass, void *data)
+diff -rupN qemu/hw/misc/custom_i2c.c qemu-3.1.0/hw/misc/custom_i2c.c
+--- qemu/hw/misc/custom_i2c.c	1970-01-01 01:00:00.000000000 +0100
++++ qemu-3.1.0/hw/misc/custom_i2c.c	2021-05-29 12:46:12.015374900 +0200
+@@ -0,0 +1,217 @@
++/**
++ * @file custom_i2c.c
++ * @brief Custom I2C sensor component
++ *
++ * File represents custom I2C slave component which stores shared memory value
++ * in its' register and transmits it to master when needed.
++ *
++ * @date 2021
++ * @author Dragan Bozinovic (bozinovicdragan96@gmail.com)
++ *
++ * @version [1.0 @ 05/2021] Initial version
++ */
++
++#include "qemu/osdep.h"
++#include "qemu-common.h"
++#include "qemu/log.h"
++#include "hw/i2c/i2c.h"
++
++/* Aditional includes, needed for shared memory */
++#include <fcntl.h>      /* Defines O_* constants */
++#include <sys/stat.h>   /* Defines mode constants */
++#include <sys/mman.h>   /* Defines mmap flags */
++
++#define TYPE_CUSTOM_I2C_SENS "custom.i2csens"
++
++#define CUSTOM_I2C_SENS(obj) \
++    OBJECT_CHECK(CustomI2CSensor, (obj), TYPE_CUSTOM_I2C_SENS)
++
++#ifndef DEBUG_CUSTOM_I2C_SENS
++#define DEBUG_CUSTOM_I2C_SENS 0
++#endif
++
++#define DB_PRINT(fmt, args...) do { \
++    if (DEBUG_CUSTOM_I2C_SENS) { \
++        qemu_log("%s: " fmt, __func__, ## args); \
++    } \
++} while (0)
++
++/* Registers */
++#define REG_CTRL_OFFSET                 (0x0)
++#define REG_DATA_OFFSET                 (0x1)
++#define NUM_REGS                         (2)
++#define REG_CTRL_EN_MASK                (0x01)
++
++/* Function which makes shared memory segment and returns pointer to it */
++static void * get_shmem_pointer(void)
++{
++    int fd, seg_size;
++    void *addr;
++
++    DB_PRINT("I2C shared memory initialization\n");
++
++    /* Auxiliary variable for storing size of shared memory */
++    seg_size = sizeof(uint32_t);
++
++    /* Create new shared memory object */
++    fd = shm_open("i2c", O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR);
++    if (fd == -1){
++        DB_PRINT("Function shm_open failed\n");
++    }
++
++    /* Set sh. mem. segment size */
++    if (ftruncate(fd, seg_size) == -1){
++        DB_PRINT("Truncating shared memory failed\n");
++    }
++
++    /* Map shared memory object to process virtual address space */
++    addr = (uint32_t*)mmap(NULL, seg_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (addr == MAP_FAILED) {
++        DB_PRINT("Memory mapping failed\n");
++    }
++
++    /* Close appropriate sh. mem. object */
++    if (close(fd) == -1){
++        DB_PRINT("Closing shmem file descriptor failed\n");
++    }
++
++    return addr;
++}
++
++/* Simple I2C slave which reads value from shared memory. */
++typedef struct CustomI2CSensor {
++    /*< private >*/
++    I2CSlave i2c;
++    /*< public >*/
++    uint8_t regs[NUM_REGS];         // peripheral registers
++    uint8_t count;                  // counter used for tx/rx
++    uint8_t ptr;                    // current register index
++    uint8_t *shmem;                 // shared memory pointer
++} CustomI2CSensor;
++
++/* Reset counter and current register index */
++static void custom_i2c_sens_reset(DeviceState *ds)
++{
++    CustomI2CSensor *s = CUSTOM_I2C_SENS(ds);
++
++    memset(s->regs, 0, NUM_REGS);
++    s->count = 0;
++}
++
++/* Check for read event for master. If peripheral is enabled, read value
++ * from shared memory, otherwise load 0x00.
++ */
++static int custom_i2c_sens_event(I2CSlave *i2c, enum i2c_event event)
++{
++    CustomI2CSensor *s = CUSTOM_I2C_SENS(i2c);
++
++    if (event == I2C_START_RECV) {
++        if ((s->ptr == REG_DATA_OFFSET))
++        {
++            if (s->regs[REG_CTRL_OFFSET] & REG_CTRL_EN_MASK)
++            {
++                s->regs[REG_DATA_OFFSET] = *s->shmem;
++            }
++            else
++            {
++                s->regs[REG_DATA_OFFSET] = 0x00;
++            }
++        }
++    }
++
++    s->count = 0;
++
++    return 0;
++}
++
++/* Called when master requests read */
++static int custom_i2c_sens_rx(I2CSlave *i2c)
++{
++    CustomI2CSensor *s = CUSTOM_I2C_SENS(i2c);
++
++    if (s->ptr >= NUM_REGS)
++    {
++        return 0xff;
++    }
++    else
++    {
++        return s->regs[s->ptr++];
++    }
++}
++
++/* Called when master sends write */
++static int custom_i2c_sens_tx(I2CSlave *i2c, uint8_t data)
++{
++    CustomI2CSensor *s = CUSTOM_I2C_SENS(i2c);
++
++    if (s->count == 0)
++    {
++        /* Store register address */
++        s->ptr = data;
++        s->count++;
++    }
++    else
++    {
++        if (s->ptr == REG_CTRL_OFFSET)
++        {
++            s->regs[s->ptr++] = data;
++        }
++    }
++
++    return 0;
++}
++
++/* Initialization */
++static void custom_i2c_sens_init(Object *obj)
++{
++    CustomI2CSensor *s = CUSTOM_I2C_SENS(obj);
++
++    memset(s->regs, 0, NUM_REGS);
++    s->count = 0;
++    s->ptr = 0;
++    
++    s->shmem = get_shmem_pointer();
++
++    return;
++}
++
++static const VMStateDescription vmstate_custom_i2c_sens = {
++    .name = TYPE_CUSTOM_I2C_SENS,
++    .version_id = 1,
++    .fields = (VMStateField[]) {
++        VMSTATE_UINT8_ARRAY(regs, CustomI2CSensor, NUM_REGS),
++        VMSTATE_UINT8(count, CustomI2CSensor),
++        VMSTATE_UINT8(ptr, CustomI2CSensor),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++
++
++static void custom_i2c_sens_class_init(ObjectClass *oc, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++    I2CSlaveClass *isc = I2C_SLAVE_CLASS(oc);
++
++    dc->reset = custom_i2c_sens_reset;
++    dc->vmsd = &vmstate_custom_i2c_sens;
++    isc->event = custom_i2c_sens_event;
++    isc->recv = custom_i2c_sens_rx;
++    isc->send = custom_i2c_sens_tx;
++}
++
++static TypeInfo custom_i2c_sens_info = {
++    .name = TYPE_CUSTOM_I2C_SENS,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(CustomI2CSensor),
++    .instance_init = custom_i2c_sens_init,
++    .class_init = custom_i2c_sens_class_init
++};
++
++static void custom_i2c_sens_register_devices(void)
++{
++    type_register_static(&custom_i2c_sens_info);
++}
++
++type_init(custom_i2c_sens_register_devices);
++
+diff -rupN qemu/hw/misc/custom_mmsens.c qemu-3.1.0/hw/misc/custom_mmsens.c
+--- qemu/hw/misc/custom_mmsens.c	1970-01-01 01:00:00.000000000 +0100
++++ qemu-3.1.0/hw/misc/custom_mmsens.c	2021-05-29 12:52:21.793127183 +0200
+@@ -0,0 +1,280 @@
++/**
++ * @file custom_i2c.c
++ * @brief Custom memory mapped sensor component
++ *
++ * File represents custom memory mapped sensor component which stores
++ * shared memory value in its' register after specific period of time.
++ *
++ * @date 2021
++ * @author Dragan Bozinovic (bozinovicdragan96@gmail.com)
++ *
++ * @version [1.0 @ 05/2021] Initial version
++ */
++
++#include "qemu/osdep.h"
++#include "qemu-common.h"
++#include "qemu/main-loop.h"
++#include "qemu/log.h"
++#include "hw/ptimer.h"
++#include "hw/sysbus.h"
++#include "hw/register.h"
++
++/* Aditional includes, needed for shared memory */
++#include <fcntl.h>      /* Defines O_* constants */
++#include <sys/stat.h>   /* Defines mode constants */
++#include <sys/mman.h>   /* Defines mmap flags */
++
++#define TYPE_CUSTOM_MM_SENS "custom.mmsens"
++
++#define CUSTOM_MM_SENS(obj) \
++    OBJECT_CHECK(CustomMMSensor, (obj), TYPE_CUSTOM_MM_SENS)
++
++
++#ifndef CUSTOM_MM_SENS_ERR_DEBUG
++#define CUSTOM_MM_SENS_ERR_DEBUG 0
++#endif
++
++#define DB_PRINT(fmt, args...) do { \
++    if (CUSTOM_MM_SENS_ERR_DEBUG) { \
++        qemu_log("%s: " fmt, __func__, ## args); \
++    } \
++} while (0)
++
++/* Registers */
++REG32(CTRL, 0x00)
++    FIELD(CTRL,     EN,         0,  1)      /* Component enable */
++    FIELD(CTRL,     IEN,        1,  1)      /* Interrupt enable */
++
++REG32(STATUS, 0x04)
++    FIELD(STATUS,   IFG,        1,  1)      /* Interrupt flag */
++
++REG32(DATA, 0x08)
++    FIELD(DATA,     SAMPLE,     0,  8)      /* Current value */
++
++/* Number of registers */
++#define R_MAX   ((R_DATA) + 1)
++
++/* Frequency of updating data register with value from shared memory */
++#define DATA_UPDATE_FREQ    (1)
++
++/* Function which makes shared memory segment and returns pointer to it */
++static void * get_shmem_pointer(void)
++{
++    int fd, seg_size;
++    void *addr;
++
++    DB_PRINT("MMS shared memory initialization\n");
++
++    /* Auxiliary variable for storing size of shared memory */
++    seg_size = sizeof(uint32_t);
++
++    /* Create new shared memory object */
++    fd = shm_open("mmsens", O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR);
++    if (fd == -1){
++        DB_PRINT("Function shm_open failed\n");
++    }
++
++    /* Set sh. mem. segment size */
++    if (ftruncate(fd, seg_size) == -1){
++        DB_PRINT("Truncating shared memory failed\n");
++    }
++
++    /* Map shared memory object to process virtual address space */
++    addr = (uint32_t*)mmap(NULL, seg_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    if (addr == MAP_FAILED) {
++        DB_PRINT("Memory mapping failed\n");
++    }
++
++    /* Close appropriate sh. mem. object */
++    if (close(fd) == -1){
++        DB_PRINT("Closing shmem file descriptor failed\n");
++    }
++
++    return addr;
++}
++
++/* Simple memory mapped sensor which reads value from shared memory. */
++typedef struct CustomMMSensor {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++
++    ptimer_state *timer;
++    QEMUBH *bh;
++    
++    uint8_t *shmem;                 /* Shared memory pointer */
++
++    uint32_t regs[R_MAX];
++    RegisterInfo regs_info[R_MAX];
++} CustomMMSensor;
++
++/*
++ * IRQ generator. If alarm is enabled and is set, trigger interrupt.
++ */
++static void custom_mm_sens_update_irq(CustomMMSensor *s)
++{
++    bool pending = s->regs[R_CTRL] & s->regs[R_STATUS] & R_CTRL_IEN_MASK;
++
++    DB_PRINT("Interrupt %s\n", pending ? "generated" : "none");
++
++    qemu_set_irq(s->irq, pending);
++}
++
++/*
++ * Update measured data. Read data from shared memory and update data register.
++ */
++static void custom_mm_sens_update_data(void *opaque)
++{
++    CustomMMSensor *s = CUSTOM_MM_SENS(opaque);
++    
++    s->regs[R_DATA] = *s->shmem;
++
++    s->regs[R_STATUS] |= R_STATUS_IFG_MASK;
++
++    DB_PRINT("Updating data %d\n", s->regs[R_DATA]);
++
++    custom_mm_sens_update_irq(s);
++}
++
++/*
++ * Reset component registers and variables.
++ */
++static void custom_mm_sens_reset(DeviceState *dev)
++{
++    CustomMMSensor *s = CUSTOM_MM_SENS(dev);
++    int i;
++
++    for (i = 0; i < R_MAX; ++i) {
++        register_reset(&s->regs_info[i]);
++    }
++}
++
++/*
++ * CTRL register updates
++ * 
++ * If component is enabled, start timer, else stop timer.
++ * If interrupt is enabled, check if interrupt needs to be generated.
++ */
++static void r_ctrl_post_write(RegisterInfo *reg, uint64_t val)
++{
++    CustomMMSensor *s = CUSTOM_MM_SENS(reg->opaque);
++    
++
++    if (s->regs[R_CTRL] & R_CTRL_EN_MASK) {
++        /* Start timer if not started*/
++        ptimer_run(s->timer, 0);
++
++        if (s->regs[R_CTRL] & R_CTRL_IEN_MASK) {
++            /* Check if alarm should be triggered */
++            custom_mm_sens_update_irq(s);
++        }
++    } else {
++        /* Stop timer */
++        ptimer_stop(s->timer);
++    }
++}
++
++/*
++ * STATUS register updates
++ * 
++ * Clear interrupt flag
++ */
++static void r_status_post_write(RegisterInfo *reg, uint64_t val)
++{
++    CustomMMSensor *s = CUSTOM_MM_SENS(reg->opaque);
++
++    DB_PRINT("Wrote %lu to STATUS\n", val);
++
++    custom_mm_sens_update_irq(s);
++}
++
++static const RegisterAccessInfo custom_mm_sens_regs_info[] = {
++    {   .name = "CTRL",           .addr = A_CTRL,
++        .reset = 0,
++        .rsvd = ~(R_CTRL_EN_MASK | R_CTRL_IEN_MASK),
++        .post_write = r_ctrl_post_write,
++    },
++    {   .name = "STATUS",           .addr = A_STATUS,
++        .reset = 0,
++        .rsvd = ~R_STATUS_IFG_MASK,
++        .post_write = r_status_post_write,
++    },
++    {   .name = "DATA",         .addr = A_DATA,
++        .reset = 0,
++        .rsvd = ~R_DATA_SAMPLE_MASK,
++        .ro = R_DATA_SAMPLE_MASK,
++    },
++};
++
++static const MemoryRegionOps custom_mm_sens_reg_ops = {
++    .read = register_read_memory,
++    .write = register_write_memory,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    }
++};
++
++static const VMStateDescription vmstate_custom_mm_sens = {
++    .name = "custom_mm_sens_cmd",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, CustomMMSensor, R_MAX),
++        VMSTATE_PTIMER(timer, CustomMMSensor),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static void custom_mm_sens_init(Object *obj)
++{
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++    CustomMMSensor *s = CUSTOM_MM_SENS(obj);
++    RegisterInfoArray *reg_array;
++
++    sysbus_init_irq(sbd, &s->irq);
++
++    memory_region_init(&s->iomem, obj, "custom.mmsens", R_MAX * 4);
++    reg_array = register_init_block32(DEVICE(obj), custom_mm_sens_regs_info,
++                                      ARRAY_SIZE(custom_mm_sens_regs_info),
++                                      s->regs_info, s->regs,
++                                      &custom_mm_sens_reg_ops,
++                                      CUSTOM_MM_SENS_ERR_DEBUG,
++                                      R_MAX * 4);
++    memory_region_add_subregion(&s->iomem,
++                                A_CTRL,
++                                &reg_array->mem);
++
++    sysbus_init_mmio(sbd, &s->iomem);
++    
++    s->shmem = get_shmem_pointer();
++
++    s->bh = qemu_bh_new(custom_mm_sens_update_data, s);
++    s->timer = ptimer_init(s->bh, PTIMER_POLICY_CONTINUOUS_TRIGGER);
++    ptimer_set_freq(s->timer, DATA_UPDATE_FREQ);
++}
++
++static void custom_mm_sens_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->reset = custom_mm_sens_reset;
++    dc->vmsd = &vmstate_custom_mm_sens;
++}
++
++static const TypeInfo custom_mm_sens_info = {
++    .name           = TYPE_CUSTOM_MM_SENS,
++    .parent         = TYPE_SYS_BUS_DEVICE,
++    .instance_size  = sizeof(CustomMMSensor),
++    .instance_init  = custom_mm_sens_init,
++    .class_init     = custom_mm_sens_class_init,
++};
++
++static void custom_mm_sens_register_types(void)
++{
++    type_register_static(&custom_mm_sens_info);
++}
++
++type_init(custom_mm_sens_register_types)
+diff -rupN qemu/hw/misc/Makefile.objs qemu-3.1.0/hw/misc/Makefile.objs
+--- qemu/hw/misc/Makefile.objs	2018-12-11 18:44:34.000000000 +0100
++++ qemu-3.1.0/hw/misc/Makefile.objs	2021-05-20 16:00:47.949264783 +0200
+@@ -74,3 +74,6 @@ obj-$(CONFIG_PVPANIC) += pvpanic.o
+ obj-$(CONFIG_AUX) += auxbus.o
+ obj-$(CONFIG_ASPEED_SOC) += aspeed_scu.o aspeed_sdmc.o
+ obj-$(CONFIG_MSF2) += msf2-sysreg.o
++
++obj-y += custom_i2c.o
++obj-y += custom_mmsens.o

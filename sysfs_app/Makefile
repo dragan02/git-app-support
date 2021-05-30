@@ -2,7 +2,7 @@ CC=arm-linux-gnueabihf-gcc
 MCPU=cortex-a9
 
 CFLAGS=-g -mcpu=${MCPU}
-LDFLAGS=
+LDFLAGS=-lpthread
 
 OBJS=sysfs_app.o
 

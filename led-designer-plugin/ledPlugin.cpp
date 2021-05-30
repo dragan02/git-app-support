@@ -32,7 +32,7 @@ QString LEDPlugin::includeFile() const
 
 QString LEDPlugin::name() const
 {
-    return "Custom LED";
+	return "LED";
 }
 
 QString LEDPlugin::toolTip() const

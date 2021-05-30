@@ -30,11 +30,11 @@
 #include <sys/mman.h> /* Defines mmap flags */
 
 LED::LED(QWidget* parent) :
-    QWidget(parent),
+	QWidget(parent),
     diameter_(10),
     color_(QColor("green")),
-    alignment_(Qt::AlignCenter),
-    state_(true),
+	alignment_(Qt::AlignCenter),
+	state_(true),
     gpioPin_(0),
     refreshRate_(100),
     data_(NULL)
@@ -48,56 +48,60 @@ LED::LED(QWidget* parent) :
     /* Instantiate timer, connect its' timeout signal to
      * refresh slot function and start it
      */
-    timer_ = new QTimer(this);
+	timer_ = new QTimer(this);
     connect(timer_, SIGNAL(timeout()), this, SLOT(refreshGpio()));
     timer_->start(refreshRate_);
 }
 
 LED::~LED()
 {
+    /* Unlink shared memory */
+    if (shm_unlink("test1") == -1){
+        qDebug() << "Unlinking sh. mem. file descriptor failed!\n";
+    }
 }
 
 
 double LED::diameter() const
 {
-    return diameter_;
+	return diameter_;
 }
 
 void LED::setDiameter(double diameter)
 {
-    diameter_ = diameter;
+	diameter_ = diameter;
 
-    pixX_ = round(double(height())/heightMM());
-    pixY_ = round(double(width())/widthMM());
+	pixX_ = round(double(height())/heightMM());
+	pixY_ = round(double(width())/widthMM());
 
-    diamX_ = diameter_*pixX_;
-    diamY_ = diameter_*pixY_;
+	diamX_ = diameter_*pixX_;
+	diamY_ = diameter_*pixY_;
 
-    update();
+	update();
 }
 
 
 QColor LED::color() const
 {
-    return color_;
+	return color_;
 }
 
 void LED::setColor(const QColor& color)
 {
-    color_ = color;
-    update();
+	color_ = color;
+	update();
 }
 
 Qt::Alignment LED::alignment() const
 {
-    return alignment_;
+	return alignment_;
 }
 
 void LED::setAlignment(Qt::Alignment alignment)
 {
-    alignment_ = alignment;
+	alignment_ = alignment;
 
-    update();
+	update();
 }
 
 
@@ -132,7 +136,7 @@ setRefreshRate(int rate)
 void LED::
 setState(bool state)
 {
-    state_ = state;
+	state_ = state;
     update();
 }
 
@@ -158,59 +162,59 @@ void LED::refreshGpio()
 
 int LED::heightForWidth(int width) const
 {
-    return width;
+	return width;
 }
 
 QSize LED::sizeHint() const
 {
-    return QSize(diamX_, diamY_);
+	return QSize(diamX_, diamY_);
 }
 
 QSize LED::minimumSizeHint() const
 {
-    return QSize(diamX_, diamY_);
+	return QSize(diamX_, diamY_);
 }
 
 void LED::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
 
-    QPainter p(this);
+	QPainter p(this);
 
-    QRect geo = geometry();
-    int width = geo.width();
-    int height = geo.height();
+	QRect geo = geometry();
+	int width = geo.width();
+	int height = geo.height();
 
-    int x=0, y=0;
-    if ( alignment_ & Qt::AlignLeft )
-        x = 0;
-    else if ( alignment_ & Qt::AlignRight )
-        x = width-diamX_;
-    else if ( alignment_ & Qt::AlignHCenter )
-        x = (width-diamX_)/2;
-    else if ( alignment_ & Qt::AlignJustify )
-        x = 0;
+	int x=0, y=0;
+	if ( alignment_ & Qt::AlignLeft )
+		x = 0;
+	else if ( alignment_ & Qt::AlignRight )
+		x = width-diamX_;
+	else if ( alignment_ & Qt::AlignHCenter )
+		x = (width-diamX_)/2;
+	else if ( alignment_ & Qt::AlignJustify )
+		x = 0;
 
-    if ( alignment_ & Qt::AlignTop )
-        y = 0;
-    else if ( alignment_ & Qt::AlignBottom )
-        y = height-diamY_;
-    else if ( alignment_ & Qt::AlignVCenter )
-        y = (height-diamY_)/2;
+	if ( alignment_ & Qt::AlignTop )
+		y = 0;
+	else if ( alignment_ & Qt::AlignBottom )
+		y = height-diamY_;
+	else if ( alignment_ & Qt::AlignVCenter )
+		y = (height-diamY_)/2;
 
-    QRadialGradient g(x+diamX_/2, y+diamY_/2, diamX_*0.4,
-        diamX_*0.4, diamY_*0.4);
+	QRadialGradient g(x+diamX_/2, y+diamY_/2, diamX_*0.4,
+		diamX_*0.4, diamY_*0.4);
 
-    g.setColorAt(0, Qt::white);
-    if ( state_ )
-        g.setColorAt(1, color_);
-    else
-        g.setColorAt(1, Qt::black);
-    QBrush brush(g);
+	g.setColorAt(0, Qt::white);
+	if ( state_ )
+		g.setColorAt(1, color_);
+	else
+		g.setColorAt(1, Qt::black);
+	QBrush brush(g);
 
-    p.setPen(color_);
-    p.setRenderHint(QPainter::Antialiasing, true);
-    p.setBrush(brush);
+	p.setPen(color_);
+	p.setRenderHint(QPainter::Antialiasing, true);
+	p.setBrush(brush);
     p.drawEllipse(x, y, diamX_-1, diamY_-1);
 
 }
@@ -222,7 +226,7 @@ void LED::mapToSharedMemory()
     segSize = sizeof(unsigned int);
 
     /* Create new shared memory object */
-    fd = shm_open("gpio", O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR);
+    fd = shm_open("test1", O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR);
     if (fd == -1){
         qDebug() << "Function shm_open failed!\n";
     }
